@@ -26,14 +26,53 @@ const defaultState = () => ({
   bookings: [],
   waitlist: [],
   blocks: [],
+  freed: [],
   people: [],
   log: [],
   admin: { pinHash: null, setBy: null },
-  settings: { horizonDays: 30, onePerDay: true, adminEmail: "mahyar.harirchi@telenor.no" },
+  settings: { horizonDays: 30, onePerDay: true, maxPerWeek: 0, notice: "", adminEmail: "mahyar.harirchi@telenor.no" },
 });
+
+// Kvoten følger kalenderuken (mandag–søndag), samme uke som vises i
+// navigasjonen. 0 betyr ingen grense.
+function weekKey(iso) {
+  const d = fromISO(iso);
+  const t = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  t.setDate(t.getDate() + 3 - ((t.getDay() + 6) % 7));
+  return `${t.getFullYear()}-${String(isoWeek(d)).padStart(2, "0")}`;
+}
+
+// En tillatelse kan være fast reservert enkelte ukedager. Da er den ikke
+// bookbar for andre, med mindre eieren frigir akkurat den datoen.
+function fixedFor(permit, iso) {
+  const f = permit?.fixed;
+  if (!f || !f.user || !Array.isArray(f.days)) return null;
+  return f.days.includes(dayIdx(iso)) ? f : null;
+}
+
+function countWeek(bookings, user, iso) {
+  const k = weekKey(iso);
+  return bookings.filter((b) => b.user === user && weekKey(b.date) === k).length;
+}
 
 const normPlate = (s) => (s || "").toUpperCase().replace(/[^A-Z0-9ÆØÅ]/g, "");
 const plateLooksOk = (s) => /^[A-Z0-9ÆØÅ]{2,7}$/.test(normPlate(s));
+
+function exportCsv(state) {
+  const label = (id) => (state.permits.find((p) => p.id === id) || {}).label || "?";
+  const plate = (name) => (state.people.find((p) => p.name === name) || {}).plate || "";
+  const rows = [["dato", "ukedag", "tillatelse", "navn", "skilt"]];
+  [...state.bookings]
+    .sort((a, b) => a.date.localeCompare(b.date))
+    .forEach((b) => rows.push([b.date, DAYS[dayIdx(b.date)], label(b.permitId), b.user, plate(b.user)]));
+  const csv = rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(";")).join("\n");
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = `parkering-${toISO(new Date())}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
 
 function mailto(to, subject, body) {
   return `mailto:${to}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
@@ -52,6 +91,7 @@ function normalize(s) {
     bookings: Array.isArray(s?.bookings) ? s.bookings : [],
     waitlist: Array.isArray(s?.waitlist) ? s.waitlist : [],
     blocks: Array.isArray(s?.blocks) ? s.blocks : [],
+    freed: Array.isArray(s?.freed) ? s.freed : [],
     people: Array.isArray(s?.people) ? s.people : [],
     log: Array.isArray(s?.log) ? s.log : [],
     admin: { ...base.admin, ...(s?.admin || {}) },
@@ -61,6 +101,7 @@ function normalize(s) {
   const cutoff = toISO(addDays(new Date(), -120));
   out.bookings = out.bookings.filter((b) => b.date >= cutoff);
   out.blocks = out.blocks.filter((b) => b.date >= cutoff);
+  out.freed = out.freed.filter((f) => f.date >= cutoff);
   out.waitlist = out.waitlist.filter((w) => w.date >= toISO(new Date()));
   out.log = out.log.slice(0, 150);
   return out;
@@ -220,27 +261,31 @@ export default function App() {
     } catch {
       /* profilen lever videre i økten */
     }
+    let needsMail = false;
     await mutate((s) => {
       if (old && old !== clean) {
         s.bookings = s.bookings.map((b) => (b.user === old ? { ...b, user: clean } : b));
         s.waitlist = s.waitlist.map((w) => (w.user === old ? { ...w, user: clean } : w));
         s.people = s.people.map((p) => (p.name === old ? { ...p, name: clean } : p));
       }
-      const existing = s.people.find((p) => p.name === clean);
+      const existing = s.people.find((p) => p.name.toLowerCase() === clean.toLowerCase());
       if (existing) {
         if (existing.plate !== pl) {
           existing.plate = pl;
           existing.approved = false;
           existing.ts = Date.now();
+          needsMail = true;
           pushLog(s, clean, `endret skilt til ${pl}`);
         }
       } else {
         s.people.push({ id: uid(), name: clean, plate: pl, approved: false, ts: Date.now() });
+        needsMail = true;
         pushLog(s, clean, `registrerte seg med ${pl}`);
       }
       return s;
     });
-    setMailPrompt({ name: clean, plate: pl });
+    if (needsMail) setMailPrompt({ name: clean, plate: pl });
+    else setToast("Velkommen tilbake. Bilen din ligger allerede inne.");
   }
 
   /* --------------------------- handlinger --------------------------- */
@@ -253,6 +298,17 @@ export default function App() {
       }
       if (s.settings.onePerDay && s.bookings.some((b) => b.date === date && b.user === me)) {
         setToast("Du har allerede en plass denne dagen.");
+        return s;
+      }
+      const cap = s.settings.maxPerWeek || 0;
+      if (cap > 0 && countWeek(s.bookings, me, date) >= cap) {
+        setToast(`Du har brukt kvoten på ${cap} ${cap === 1 ? "dag" : "dager"} denne uken.`);
+        return s;
+      }
+      const permit = s.permits.find((x) => x.id === permitId);
+      const fx = fixedFor(permit, date);
+      if (fx && fx.user !== me && !s.freed.some((f) => f.permitId === permitId && f.date === date)) {
+        setToast(`Plassen er fast reservert for ${fx.user} denne ukedagen.`);
         return s;
       }
       s.bookings.push({ id: uid(), date, permitId, user: me, ts: Date.now() });
@@ -282,6 +338,11 @@ export default function App() {
   const joinWaitlist = (date) =>
     mutate((s) => {
       if (s.waitlist.some((w) => w.date === date && w.user === me)) return s;
+      const cap = s.settings.maxPerWeek || 0;
+      if (cap > 0 && countWeek(s.bookings, me, date) >= cap) {
+        setToast("Ukekvoten din er brukt opp. Frigi en dag først.");
+        return s;
+      }
       s.waitlist.push({ id: uid(), date, user: me, ts: Date.now() });
       setToast("Du står på ventelisten. Du får plassen automatisk hvis noen frigir den.");
       return s;
@@ -415,7 +476,10 @@ export default function App() {
       const w = s.waitlist.find((x) => x.id === id);
       if (!w) return s;
       const free = s.permits.find(
-        (p) => !s.bookings.some((b) => b.date === w.date && b.permitId === p.id) && !s.blocks.some((x) => x.date === w.date && x.permitId === p.id)
+        (p) =>
+          !s.bookings.some((b) => b.date === w.date && b.permitId === p.id) &&
+          !s.blocks.some((x) => x.date === w.date && x.permitId === p.id) &&
+          !(fixedFor(p, w.date) && !s.freed.some((f) => f.permitId === p.id && f.date === w.date))
       );
       if (!free) {
         setToast("Ingen ledig plass den dagen. Fjern en booking først.");
@@ -441,6 +505,50 @@ export default function App() {
       const p = s.people.find((x) => x.id === personId);
       s.people = s.people.filter((x) => x.id !== personId);
       return p ? pushLog(s, me, `fjernet ${p.name} (${p.plate})`) : s;
+    });
+
+  const setFixed = (permitId, days, user) =>
+    mutate((s) => {
+      const p = s.permits.find((x) => x.id === permitId);
+      if (!p) return s;
+      p.fixed = days.length && user.trim() ? { days, user: user.trim() } : null;
+      return pushLog(s, me, p.fixed ? `satte faste dager på ${p.label} for ${p.fixed.user}` : `fjernet faste dager på ${p.label}`);
+    });
+
+  const freeFixedDay = (permitId, date) =>
+    mutate((s) => {
+      if (s.freed.some((f) => f.permitId === permitId && f.date === date)) return s;
+      s.freed.push({ id: uid(), permitId, date, by: me, ts: Date.now() });
+      setToast("Dagen er frigitt og kan bookes av andre.");
+      return pushLog(s, me, `frigjorde den faste plassen ${date}`);
+    });
+
+  const restoreFixedDay = (permitId, date) =>
+    mutate((s) => {
+      s.freed = s.freed.filter((f) => !(f.permitId === permitId && f.date === date));
+      return pushLog(s, me, `tok tilbake den faste plassen ${date}`);
+    });
+
+  const blockRange = (permitId, from, to, reason) =>
+    mutate((s) => {
+      if (!permitId || !from || !to || from > to) {
+        setToast("Sjekk datoene.");
+        return s;
+      }
+      let n = 0;
+      let skipped = 0;
+      for (let d = fromISO(from); toISO(d) <= to; d = addDays(d, 1)) {
+        const iso = toISO(d);
+        if (s.blocks.some((b) => b.date === iso && b.permitId === permitId)) continue;
+        if (s.bookings.some((b) => b.date === iso && b.permitId === permitId)) {
+          skipped++;
+          continue;
+        }
+        s.blocks.push({ id: uid(), date: iso, permitId, reason: reason.trim(), by: me, ts: Date.now() });
+        n++;
+      }
+      setToast(skipped ? `${n} dager sperret. ${skipped} hoppet over fordi de var booket.` : `${n} dager sperret.`);
+      return pushLog(s, me, `sperret ${n} dager fra ${from} til ${to}${reason.trim() ? `: ${reason.trim()}` : ""}`);
     });
 
   const clearFuture = () =>
@@ -481,7 +589,7 @@ export default function App() {
   if (!me) {
     return (
       <Shell>
-        <Register onSave={saveProfile} />
+        <Register onSave={saveProfile} people={state.people} />
         {mailPrompt && (
           <Sheet title="Siste steg" onClose={() => setMailPrompt(null)}>
             <MailPrompt info={mailPrompt} email={state.settings.adminEmail} onDone={() => setMailPrompt(null)} />
@@ -492,6 +600,7 @@ export default function App() {
   }
 
   const permits = state.permits;
+  const weekUsed = countWeek(state.bookings, me, toISO(anchor));
 
   return (
     <Shell>
@@ -523,6 +632,10 @@ export default function App() {
         <div className="banner">
           Appen kjører uten delt database. Alt du legger inn blir liggende i denne nettleseren og deles ikke med andre — sett VITE_SUPABASE_URL og VITE_SUPABASE_ANON_KEY for å koble den på.
         </div>
+      )}
+
+      {state.settings.notice && (
+        <div className="banner notice">{state.settings.notice}</div>
       )}
 
       {myPerson && !myPerson.approved && (
@@ -557,6 +670,11 @@ export default function App() {
         </div>
         <button className="nav" onClick={() => setAnchor(addDays(anchor, 7))} aria-label="Neste uke">→</button>
         <button className="nav wide" onClick={() => setAnchor(startOfWeek(new Date()))}>Denne uken</button>
+        {state.settings.maxPerWeek > 0 && (
+          <span className={`quota${weekUsed >= state.settings.maxPerWeek ? " out" : ""}`}>
+            {weekUsed} av {state.settings.maxPerWeek}
+          </span>
+        )}
         <label className="toggle">
           <input type="checkbox" checked={showWeekend} onChange={(e) => setShowWeekend(e.target.checked)} />
           Helg
@@ -579,9 +697,14 @@ export default function App() {
               permits={permits}
               bookings={state.bookings.filter((b) => b.date === date)}
               blocks={state.blocks.filter((b) => b.date === date)}
+              freed={state.freed.filter((f) => f.date === date)}
               waitlist={state.waitlist.filter((w) => w.date === date).sort((a, b) => a.ts - b.ts)}
               me={me}
               onePerDay={state.settings.onePerDay}
+              weekFull={
+                !!state.settings.maxPerWeek &&
+                countWeek(state.bookings, me, date) >= state.settings.maxPerWeek
+              }
               isAdmin={isAdmin}
               busy={busy}
               onBook={book}
@@ -592,6 +715,8 @@ export default function App() {
               onBlock={(d, p) => setBlockFor({ date: d, permitId: p })}
               onUnblock={unblockBay}
               onAdminRemove={adminRemove}
+              onFreeFixed={freeFixedDay}
+              onRestoreFixed={restoreFixedDay}
             />
           ))}
         </div>
@@ -607,6 +732,7 @@ export default function App() {
       {panel === "permits" && (
         <Sheet title="P-tillatelser" onClose={() => setPanel(null)}>
           <PermitsPanel
+            onFixed={setFixed}
             permits={permits}
             settings={state.settings}
             onAdd={addPermit}
@@ -625,6 +751,7 @@ export default function App() {
         <Sheet title="Din profil" onClose={() => setPanel(null)}>
           <Register
             current={{ name: me, plate: myPlate }}
+            people={state.people}
             compact
             onSave={async (n, p) => { await saveProfile(n, p); setPanel(null); }}
             extra={
@@ -645,7 +772,7 @@ export default function App() {
           <div className="prose">
             <p>Send lenken til denne siden til kollegaene dine. Alle som åpner den skriver inn navnet sitt én gang og ser samme kalender og samme bookinger.</p>
             <p>Bookingene lagres delt, så alt du legger inn er synlig for alle som har lenken. Ikke legg inn noe du ikke vil at hele gruppen skal se.</p>
-            <p>Regler som gjelder nå: én plass per person per dag{state.settings.onePerDay ? "" : " er slått av"}, og booking opptil {state.settings.horizonDays} dager fram i tid. Begge kan endres under «Tillatelser».</p>
+            <p>Regler som gjelder nå: én plass per person per dag{state.settings.onePerDay ? "" : " er slått av"}, {state.settings.maxPerWeek > 0 ? `maks ${state.settings.maxPerWeek} dager per uke` : "ingen ukegrense"}, og booking opptil {state.settings.horizonDays} dager fram i tid. Alt kan endres under «Tillatelser».</p>
           </div>
         </Sheet>
       )}
@@ -668,6 +795,7 @@ export default function App() {
             onApprove={setApproved}
             onRemovePerson={removePerson}
             onSetting={setSetting}
+            onBlockRange={blockRange}
           />
         </Sheet>
       )}
@@ -698,14 +826,17 @@ export default function App() {
 /*  Dag + plasser                                                      */
 /* ------------------------------------------------------------------ */
 
-function DayRow({ date, today, horizon, permits, bookings, blocks, waitlist, me, onePerDay, isAdmin, busy, onBook, onRelease, onJoin, onLeave, onAssign, onBlock, onUnblock, onAdminRemove }) {
+function DayRow({ date, today, horizon, permits, bookings, blocks, freed, waitlist, me, onePerDay, weekFull, isAdmin, busy, onBook, onRelease, onJoin, onLeave, onAssign, onBlock, onUnblock, onAdminRemove, onFreeFixed, onRestoreFixed }) {
   const d = fromISO(date);
   const past = date < today;
   const beyond = date > horizon;
   const isToday = date === today;
   const mine = bookings.find((b) => b.user === me);
   const openBays = permits.filter(
-    (p) => !bookings.some((b) => b.permitId === p.id) && !blocks.some((x) => x.permitId === p.id)
+    (p) =>
+      !bookings.some((b) => b.permitId === p.id) &&
+      !blocks.some((x) => x.permitId === p.id) &&
+      !(fixedFor(p, date) && !freed.some((f) => f.permitId === p.id))
   ).length;
   const full = permits.length > 0 && openBays === 0;
   const onList = waitlist.some((w) => w.user === me);
@@ -762,6 +893,28 @@ function DayRow({ date, today, horizon, permits, bookings, blocks, waitlist, me,
             );
           }
 
+          const fx = fixedFor(p, date);
+          const isFreed = freed.some((f) => f.permitId === p.id);
+
+          if (fx && !isFreed) {
+            const isOwner = fx.user === me;
+            return (
+              <div key={p.id} className="bay fixedbay">
+                <div className="tag">
+                  <span className="tag-hole" />
+                  <span className="plate">{p.label}</span>
+                  <span className="tag-note">Fast</span>
+                </div>
+                <div className="bay-body">
+                  <span className="holder">{isOwner ? "Din faste dag" : fx.user}</span>
+                  {(isOwner || isAdmin) && !past && (
+                    <button className="ghost" disabled={busy} onClick={() => onFreeFixed(p.id, date)}>Frigi</button>
+                  )}
+                </div>
+              </div>
+            );
+          }
+
           const blocked = past || beyond;
           return (
             <div key={p.id} className={`bay free${blocked ? " blocked" : ""}`}>
@@ -772,6 +925,9 @@ function DayRow({ date, today, horizon, permits, bookings, blocks, waitlist, me,
               <div className="bay-body">
                 <span className="holder muted">{past ? "Passert" : beyond ? "Åpner senere" : "Ledig"}</span>
                 <span className="acts">
+                  {fx && isFreed && (fx.user === me || isAdmin) && !past && (
+                    <button className="ghost" disabled={busy} onClick={() => onRestoreFixed(p.id, date)}>Ta tilbake</button>
+                  )}
                   {isAdmin && !past && (
                     <>
                       <button className="ghost" disabled={busy} onClick={() => onAssign(date, p.id)}>Tildel</button>
@@ -781,11 +937,17 @@ function DayRow({ date, today, horizon, permits, bookings, blocks, waitlist, me,
                   {!blocked && (
                     <button
                       className="primary"
-                      disabled={busy || (onePerDay && !!mine)}
-                      title={onePerDay && mine ? "Regelen «én plass per person per dag» er på" : undefined}
+                      disabled={busy || (onePerDay && !!mine) || weekFull}
+                      title={
+                        onePerDay && mine
+                          ? "Regelen «én plass per person per dag» er på"
+                          : weekFull
+                          ? "Du har brukt opp ukekvoten din"
+                          : undefined
+                      }
                       onClick={() => onBook(date, p.id)}
                     >
-                      {onePerDay && mine ? "Én per dag" : "Book"}
+                      {onePerDay && mine ? "Én per dag" : weekFull ? "Uken brukt opp" : "Book"}
                     </button>
                   )}
                 </span>
@@ -821,7 +983,7 @@ function DayRow({ date, today, horizon, permits, bookings, blocks, waitlist, me,
 /*  Paneler                                                            */
 /* ------------------------------------------------------------------ */
 
-function PermitsPanel({ permits, settings, onAdd, onUpdate, onRemove, onSetting }) {
+function PermitsPanel({ permits, settings, onAdd, onUpdate, onRemove, onSetting, onFixed }) {
   const [label, setLabel] = useState("");
   const [note, setNote] = useState("");
   const [confirm, setConfirm] = useState(null);
@@ -845,6 +1007,13 @@ function PermitsPanel({ permits, settings, onAdd, onUpdate, onRemove, onSetting 
         ))}
       </ul>
 
+      <div className="fixedblock">
+        <p className="hint">Faste dager: velg ukedager en tillatelse alltid er reservert, og hvem den er reservert for. Ingen andre kan booke de dagene, men eieren kan frigi enkeltdager i kalenderen når bilen ikke skal stå der.</p>
+        {permits.map((p) => (
+          <FixedRow key={p.id} permit={p} onFixed={onFixed} />
+        ))}
+      </div>
+
       <div className="addrow">
         <input className="mini plate-in" placeholder="P2" value={label} onChange={(e) => setLabel(e.target.value)} aria-label="Kortnavn" />
         <input className="mini" placeholder="F.eks. Snarøyveien, plan 2" value={note} onChange={(e) => setNote(e.target.value)} aria-label="Plassering" />
@@ -858,12 +1027,42 @@ function PermitsPanel({ permits, settings, onAdd, onUpdate, onRemove, onSetting 
           <span><strong>Én plass per person per dag</strong><em>Hindrer at én person tar flere tillatelser samme dag.</em></span>
         </label>
         <label className="rule">
+          <span><strong>Maks per uke</strong><em>Hvor mange dager én person kan ta i samme kalenderuke.</em></span>
+          <select value={settings.maxPerWeek || 0} onChange={(e) => onSetting({ maxPerWeek: Number(e.target.value) })}>
+            <option value={0}>Ingen grense</option>
+            {[1, 2, 3, 4, 5].map((n) => <option key={n} value={n}>{n} {n === 1 ? "dag" : "dager"}</option>)}
+          </select>
+        </label>
+        <label className="rule">
           <span><strong>Book inntil</strong><em>Hvor langt fram i tid dagene åpner.</em></span>
           <select value={settings.horizonDays} onChange={(e) => onSetting({ horizonDays: Number(e.target.value) })}>
             {[7, 14, 30, 60, 90].map((n) => <option key={n} value={n}>{n} dager</option>)}
           </select>
         </label>
       </div>
+    </div>
+  );
+}
+
+function FixedRow({ permit, onFixed }) {
+  const [days, setDays] = useState(permit.fixed?.days || []);
+  const [user, setUser] = useState(permit.fixed?.user || "");
+  const dirty =
+    JSON.stringify([...days].sort()) !== JSON.stringify([...(permit.fixed?.days || [])].sort()) ||
+    user !== (permit.fixed?.user || "");
+
+  const toggle = (i) => setDays(days.includes(i) ? days.filter((d) => d !== i) : [...days, i]);
+
+  return (
+    <div className="fixedrow">
+      <span className="rplate">{permit.label}</span>
+      <span className="daypicks">
+        {DAYS_SHORT.map((d, i) => (
+          <button key={i} className={`daypick${days.includes(i) ? " on" : ""}`} onClick={() => toggle(i)}>{d[0]}</button>
+        ))}
+      </span>
+      <input className="mini" value={user} placeholder="Reservert for" onChange={(e) => setUser(e.target.value)} aria-label="Reservert for" />
+      <button className="primary" disabled={!dirty} onClick={() => onFixed(permit.id, days, user)}>Lagre</button>
     </div>
   );
 }
@@ -893,9 +1092,19 @@ function Fordeling({ bookings, me }) {
   );
 }
 
-function Register({ onSave, current, compact, extra }) {
+function Register({ onSave, current, compact, extra, people = [] }) {
   const [name, setName] = useState(current?.name || "");
   const [plate, setPlate] = useState(current?.plate || "");
+  const [touchedPlate, setTouchedPlate] = useState(false);
+
+  const match = people.find((p) => p.name.trim().toLowerCase() === name.trim().toLowerCase());
+
+  // Kjenner vi navnet igjen, fyller vi skiltet inn selv. Ingen skal måtte
+  // huske hva de registrerte forrige gang, eller på en annen telefon.
+  useEffect(() => {
+    if (match && !touchedPlate && match.plate !== plate) setPlate(match.plate);
+  }, [match, touchedPlate]);
+
   const ok = name.trim() && plateLooksOk(plate);
   return (
     <div className={compact ? "panel" : "gate"}>
@@ -904,6 +1113,16 @@ function Register({ onSave, current, compact, extra }) {
           <span className="eyebrow">Delt p-tillatelse · Fornebu</span>
           <h2>Registrer deg</h2>
           <p>Navnet vises ved dagene du booker. Skiltnummeret trengs fordi parkeringen leses av kamera — bilen må ligge inne i Autopay for at tillatelsen skal gjelde.</p>
+        </>
+      )}
+      {!compact && people.length > 0 && (
+        <>
+          <p className="hint">Har du registrert deg før, finner du navnet ditt her:</p>
+          <div className="quick">
+            {people.slice(0, 12).map((p) => (
+              <button key={p.id} className="chip" onClick={() => { setName(p.name); setTouchedPlate(false); }}>{p.name}</button>
+            ))}
+          </div>
         </>
       )}
       <div className="fields">
@@ -917,16 +1136,23 @@ function Register({ onSave, current, compact, extra }) {
             className="mini plate-in wide"
             value={plate}
             placeholder="AB12345"
-            onChange={(e) => setPlate(e.target.value.toUpperCase())}
+            onChange={(e) => { setTouchedPlate(true); setPlate(e.target.value.toUpperCase()); }}
             onKeyDown={(e) => e.key === "Enter" && ok && onSave(name, plate)}
             aria-label="Bilskilt"
           />
         </label>
       </div>
+      {match && (
+        <p className="hint known">
+          {match.approved
+            ? `Vi kjenner deg igjen — ${match.plate} er allerede godkjent i Autopay. Bare fortsett.`
+            : `Vi kjenner deg igjen — ${match.plate} ligger inne og venter på godkjenning i Autopay.`}
+        </p>
+      )}
       {plate && !plateLooksOk(plate) && <p className="hint warnhint">Skiltet ser ikke riktig ut. Skriv det som det står på bilen, f.eks. AB12345 eller EL54321.</p>}
       <div className="gate-row">
         <button className="primary" disabled={!ok} onClick={() => onSave(name, plate)}>
-          {compact ? "Lagre" : "Registrer meg"}
+          {compact ? "Lagre" : match ? "Fortsett" : "Registrer meg"}
         </button>
         {extra}
       </div>
@@ -970,7 +1196,7 @@ function MailPrompt({ info, email, onDone }) {
   );
 }
 
-function AdminPanel({ state, me, isAdmin, today, busy, onUnlock, onLock, onChangePin, onRemove, onUnblock, onDropWait, onPromote, onClearFuture, onApprove, onRemovePerson, onSetting }) {
+function AdminPanel({ state, me, isAdmin, today, busy, onUnlock, onLock, onChangePin, onRemove, onUnblock, onDropWait, onPromote, onClearFuture, onApprove, onRemovePerson, onSetting, onBlockRange }) {
   const [pin, setPin] = useState("");
   const [newPin, setNewPin] = useState("");
   const [tab, setTab] = useState("personer");
@@ -1025,6 +1251,7 @@ function AdminPanel({ state, me, isAdmin, today, busy, onUnlock, onLock, onChang
           ["bookinger", `Bookinger (${upcoming.length})`],
           ["venteliste", `Venteliste (${waits.length})`],
           ["sperret", `Sperret (${blocks.length})`],
+          ["verktoy", "Verktøy"],
           ["logg", "Logg"],
           ["kode", "PIN"],
         ].map(([id, label]) => (
@@ -1101,6 +1328,10 @@ function AdminPanel({ state, me, isAdmin, today, busy, onUnlock, onLock, onChang
         )
       )}
 
+      {tab === "verktoy" && (
+        <ToolsTab state={state} busy={busy} onBlockRange={onBlockRange} onSetting={onSetting} />
+      )}
+
       {tab === "logg" && (
         state.log.length === 0 ? <p className="hint">Ingen hendelser ennå.</p> : (
           <ul className="log">
@@ -1123,6 +1354,49 @@ function AdminPanel({ state, me, isAdmin, today, busy, onUnlock, onLock, onChang
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+function ToolsTab({ state, busy, onBlockRange, onSetting }) {
+  const [permitId, setPermitId] = useState(state.permits[0]?.id || "");
+  const [from, setFrom] = useState(toISO(new Date()));
+  const [to, setTo] = useState(toISO(addDays(new Date(), 7)));
+  const [reason, setReason] = useState("");
+  const [notice, setNotice] = useState(state.settings.notice || "");
+
+  return (
+    <div className="panel">
+      <div className="tool">
+        <strong>Sperr en periode</strong>
+        <p className="hint">For ferie, verksted eller utlån. Dager som allerede er booket hoppes over — dem fjerner du selv under Bookinger.</p>
+        <div className="toolrow">
+          <select value={permitId} onChange={(e) => setPermitId(e.target.value)} aria-label="Tillatelse">
+            {state.permits.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
+          </select>
+          <input className="mini" type="date" value={from} onChange={(e) => setFrom(e.target.value)} aria-label="Fra dato" />
+          <input className="mini" type="date" value={to} onChange={(e) => setTo(e.target.value)} aria-label="Til dato" />
+        </div>
+        <div className="toolrow">
+          <input className="mini" value={reason} placeholder="Grunn, f.eks. «bilen er på verksted»" onChange={(e) => setReason(e.target.value)} aria-label="Grunn" />
+          <button className="primary" disabled={busy} onClick={() => onBlockRange(permitId, from, to, reason)}>Sperr</button>
+        </div>
+      </div>
+
+      <div className="tool">
+        <strong>Oppslag til gruppen</strong>
+        <p className="hint">Vises øverst hos alle. Tøm feltet for å fjerne det igjen.</p>
+        <div className="toolrow">
+          <input className="mini" value={notice} placeholder="F.eks. «P2 er utlånt uke 40»" onChange={(e) => setNotice(e.target.value)} aria-label="Oppslag" />
+          <button className="primary" onClick={() => onSetting({ notice: notice.trim() })}>Lagre</button>
+        </div>
+      </div>
+
+      <div className="tool">
+        <strong>Eksporter</strong>
+        <p className="hint">Alle bookinger med navn og skilt som CSV, klar for Excel. Nyttig som sikkerhetskopi og hvis noen spør hvem som sto der en gitt dag.</p>
+        <button className="ghost" onClick={() => exportCsv(state)}>Last ned CSV</button>
+      </div>
     </div>
   );
 }
@@ -1421,11 +1695,25 @@ const CSS = `
 .log li{display:flex;gap:10px;color:#cfd4db}
 .ltime{color:var(--concrete);flex:none;font-variant-numeric:tabular-nums}
 .quick{display:flex;gap:6px;flex-wrap:wrap}
+.quota{font-family:var(--disp);font-size:13px;letter-spacing:.08em;color:var(--concrete);border:1px solid var(--line);border-radius:6px;padding:5px 9px;white-space:nowrap}
+.quota.out{border-color:var(--paint);color:var(--paint)}
 .fields{display:flex;flex-direction:column;gap:10px}
 .field{display:flex;flex-direction:column;gap:5px}
 .field>span{font-size:12px;color:var(--concrete);text-transform:uppercase;letter-spacing:.1em;font-family:var(--disp)}
 .plate-in.wide{max-width:180px;font-size:19px;padding:9px 12px}
 .warnhint{color:#f0a49c}
+.known{color:var(--go)}
+.banner.notice{background:#2b2718;border-color:var(--paint);color:#f0e2b8}
+.bay.fixedbay{border:1px solid var(--line2);background:#242832}
+.fixedblock{display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--line);padding-top:14px}
+.fixedrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.daypicks{display:flex;gap:3px}
+.daypick{width:26px;height:26px;background:transparent;border:1px solid var(--line2);color:var(--concrete);font-size:11px;border-radius:6px;padding:0}
+.daypick.on{background:var(--paint);border-color:var(--paint);color:#191919;font-weight:700}
+.tool{display:flex;flex-direction:column;gap:7px;border-top:1px solid var(--line);padding-top:14px}
+.tool strong{font-family:var(--disp);text-transform:uppercase;letter-spacing:.08em;font-size:15px}
+.toolrow{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.toolrow select,.toolrow input[type=date]{background:var(--asphalt);border:1px solid var(--line2);color:var(--chalk);border-radius:8px;padding:7px 9px;font-size:13px;font-family:var(--body)}
 .banner.pending{background:#2b2718;border-color:var(--paint);color:#f0e2b8}
 .aslink{display:inline-flex;align-items:center;text-decoration:none;border-radius:8px}
 a.primary.aslink{padding:8px 14px}
